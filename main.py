@@ -1,118 +1,11 @@
-
 import os
 from yt_dlp import YoutubeDL
 from basic_pitch.inference import predict
 from basic_pitch import ICASSP_2022_MODEL_PATH
 import music21
-
-def download_audio(url, output_path="audio"):
-    """
-    Downloads the audio from a YouTube video.
-    """
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
-    
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'postprocessors': [{
-            'key': 'FFmpegExtractAudio',
-            'preferredcodec': 'mp3',
-            'preferredquality': '192',
-        }],
-        'outtmpl': os.path.join(output_path, '%(id)s.%(ext)s'),
-    }
-    with YoutubeDL(ydl_opts) as ydl:
-        info_dict = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info_dict)
-        base, _ = os.path.splitext(filename)
-        return base + '.mp3'
-
-def transcribe_audio(audio_path, output_path="midi"):
-    """
-    Transcribes the audio to a MIDI file.
-    """
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
-        
-    model_output, midi_data, note_events = predict(audio_path, ICASSP_2022_MODEL_PATH)
-    
-    output_midi_path = os.path.join(output_path, os.path.splitext(os.path.basename(audio_path))[0] + ".mid")
-    midi_data.write(output_midi_path)
-    return output_midi_path
-
-def create_sheet_music(midi_path, output_path="partitures"):
-    """
-    Creates sheet music from a MIDI file.
-    """
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
-        
-    score = music21.converter.parse(midi_path)
-    output_sheet_path = os.path.join(output_path, os.path.splitext(os.path.basename(midi_path))[0] + ".xml")
-    score.write('musicxml', fp=output_sheet_path)
-    return output_sheet_path
-
-def simplify_midi(midi_path, output_path="midi_simplified"):
-    """
-    Simplifies a MIDI file by quantizing and merging notes.
-    """
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
-
-    score = music21.converter.parse(midi_path)
-    
-    # Quantize the score to the nearest 16th note
-    quantized_score = score.quantize(quarterLengthDivisors=(4,))
-
-    # Merge consecutive notes/chords with the same pitch
-    for part in quantized_score.parts:
-        # Get a flat list of notes and chords
-        elements = list(part.flatten().notesAndRests)
-        notes_to_remove = []
-        
-        i = 0
-        while i < len(elements) - 1:
-            el1 = elements[i]
-            el2 = elements[i+1]
-
-            # Skip rests
-            if isinstance(el1, music21.note.Rest) or isinstance(el2, music21.note.Rest):
-                i += 1
-                continue
-
-            # Check if elements are close enough to merge
-            if el2.offset > el1.offset + el1.duration.quarterLength + 0.1:
-                i += 1
-                continue
-
-            are_notes = isinstance(el1, music21.note.Note) and isinstance(el2, music21.note.Note)
-            are_chords = isinstance(el1, music21.chord.Chord) and isinstance(el2, music21.chord.Chord)
-
-            if (are_notes and el1.pitch == el2.pitch) or \
-               (are_chords and el1.normalOrder == el2.normalOrder):
-                # Extend the duration of the first element
-                el1.duration.quarterLength += el2.duration.quarterLength
-                # Mark the second element for removal from the original stream
-                notes_to_remove.append(el2)
-                # Remove the second element from our temporary list so we don't process it again
-                elements.pop(i + 1)
-            else:
-                i += 1
-        
-        # Remove the merged notes from the actual score part
-        for note in notes_to_remove:
-            part.remove(note, recurse=True)
-
-    # Remove very short notes (less than a 32nd note)
-    for el in quantized_score.flatten().notesAndRests:
-        if isinstance(el, music21.note.Note) and el.duration.quarterLength < 0.125:
-            el.activeSite.remove(el)
-
-    simplified_midi_path = os.path.join(output_path, os.path.splitext(os.path.basename(midi_path))[0] + "_simplified.mid")
-    quantized_score.write('midi', fp=simplified_midi_path)
-    return simplified_midi_path
-
 import argparse
+import numpy as np
+from collections import Counter
 
 def download_audio(url, output_path="audio", start_time=None, end_time=None):
     """
@@ -121,7 +14,6 @@ def download_audio(url, output_path="audio", start_time=None, end_time=None):
     if not os.path.exists(output_path):
         os.makedirs(output_path)
 
-    # Use the video ID for a clean filename
     output_template = os.path.join(output_path, '%(id)s.%(ext)s')
 
     ydl_opts = {
@@ -129,7 +21,6 @@ def download_audio(url, output_path="audio", start_time=None, end_time=None):
         'outtmpl': output_template,
     }
 
-    # If start or end times are provided, download a clip
     if start_time is not None or end_time is not None:
         postprocessor_args = []
         if start_time is not None:
@@ -143,9 +34,7 @@ def download_audio(url, output_path="audio", start_time=None, end_time=None):
             'preferredquality': '192',
         }]
         ydl_opts['postprocessor_args'] = postprocessor_args
-
     else:
-        # Default behavior: download the whole audio
         ydl_opts['postprocessors'] = [{
             'key': 'FFmpegExtractAudio',
             'preferredcodec': 'mp3',
@@ -154,7 +43,6 @@ def download_audio(url, output_path="audio", start_time=None, end_time=None):
 
     with YoutubeDL(ydl_opts) as ydl:
         info_dict = ydl.extract_info(url, download=True)
-        # Construct the final path to the mp3 file
         base, _ = os.path.splitext(ydl.prepare_filename(info_dict))
         return base + '.mp3'
 
@@ -171,81 +59,296 @@ def transcribe_audio(audio_path, output_path="midi"):
     midi_data.write(output_midi_path)
     return output_midi_path
 
-def create_sheet_music(midi_path, output_path="partitures"):
+def detect_key_signature(score):
     """
-    Creates sheet music from a MIDI file.
+    Detect the key signature of the piece using music21's key analysis.
     """
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
+    try:
+        # Analyze the key using music21's built-in key detection
+        key = score.analyze('key')
+        return key
+    except:
+        # Fallback to C major if detection fails
+        return music21.key.Key('C', 'major')
+
+def filter_notes_by_confidence(score, velocity_threshold=40):
+    """
+    Remove notes with low velocity (confidence) from the score.
+    """
+    for part in score.parts:
+        notes_to_remove = []
+        for element in part.flatten().notes:
+            if hasattr(element, 'volume') and element.volume.velocity:
+                if element.volume.velocity < velocity_threshold:
+                    notes_to_remove.append(element)
+            elif isinstance(element, music21.chord.Chord):
+                # For chords, check if most notes have low velocity
+                low_velocity_count = 0
+                for note in element.notes:
+                    if hasattr(note, 'volume') and note.volume.velocity:
+                        if note.volume.velocity < velocity_threshold:
+                            low_velocity_count += 1
+                
+                if low_velocity_count > len(element.notes) / 2:
+                    notes_to_remove.append(element)
         
-    score = music21.converter.parse(midi_path)
-    output_sheet_path = os.path.join(output_path, os.path.splitext(os.path.basename(midi_path))[0] + ".xml")
-    score.write('musicxml', fp=output_sheet_path)
-    return output_sheet_path
-
-def simplify_midi(midi_path, output_path="midi_simplified"):
-    """
-    Simplifies a MIDI file by quantizing and merging notes.
-    """
-    if not os.path.exists(output_path):
-        os.makedirs(output_path)
-
-    score = music21.converter.parse(midi_path)
+        for note in notes_to_remove:
+            part.remove(note, recurse=True)
     
-    # Quantize the score to the nearest 16th note
-    quantized_score = score.quantize(quarterLengthDivisors=(4,))
+    return score
 
-    # Merge consecutive notes/chords with the same pitch
-    for part in quantized_score.parts:
-        # Get a flat list of notes and chords
+def simplify_chords(score, max_chord_notes=3):
+    """
+    Simplify chords by keeping only the most important notes.
+    """
+    for part in score.parts:
+        for element in part.flatten().notes:
+            if isinstance(element, music21.chord.Chord) and len(element.notes) > max_chord_notes:
+                # Keep root, third, fifth, and seventh if present
+                pitches = [n.pitch for n in element.notes]
+                pitches.sort(key=lambda x: x.midi)
+                
+                # Try to keep important chord tones
+                simplified_pitches = []
+                if len(pitches) >= 1:
+                    simplified_pitches.append(pitches[0])  # Root (lowest)
+                if len(pitches) >= 3:
+                    simplified_pitches.append(pitches[2])  # Third
+                if len(pitches) >= 5 and len(simplified_pitches) < max_chord_notes:
+                    simplified_pitches.append(pitches[4])  # Fifth
+                
+                # Fill remaining slots with highest notes
+                remaining_slots = max_chord_notes - len(simplified_pitches)
+                for i in range(remaining_slots):
+                    if len(pitches) - 1 - i >= 0:
+                        pitch = pitches[-(i+1)]
+                        if pitch not in simplified_pitches:
+                            simplified_pitches.append(pitch)
+                
+                # Replace the chord
+                element.pitches = simplified_pitches
+    
+    return score
+
+def quantize_to_common_rhythms(score):
+    """
+    Quantize to common rhythms (whole, half, quarter, eighth, sixteenth notes).
+    """
+    common_durations = [4.0, 2.0, 1.0, 0.5, 0.25]  # Whole, half, quarter, eighth, sixteenth
+    
+    for part in score.parts:
+        for element in part.flatten().notes:
+            current_duration = element.duration.quarterLength
+            
+            # Find the closest common duration
+            closest_duration = min(common_durations, key=lambda x: abs(x - current_duration))
+            
+            # Only change if it's reasonably close
+            if abs(closest_duration - current_duration) < current_duration * 0.3:
+                element.duration.quarterLength = closest_duration
+    
+    return score
+
+def remove_ornaments_and_grace_notes(score):
+    """
+    Remove very short notes that are likely ornaments or grace notes.
+    """
+    min_duration = 0.1  # Remove notes shorter than this
+    
+    for part in score.parts:
+        notes_to_remove = []
+        for element in part.flatten().notes:
+            if element.duration.quarterLength < min_duration:
+                notes_to_remove.append(element)
+        
+        for note in notes_to_remove:
+            part.remove(note, recurse=True)
+    
+    return score
+
+def merge_tied_notes(score):
+    """
+    Merge notes that should be tied together.
+    """
+    for part in score.parts:
         elements = list(part.flatten().notes)
         notes_to_remove = []
         
         i = 0
         while i < len(elements) - 1:
             el1 = elements[i]
-            el2 = elements[i+1]
-
-            # Check if elements are close enough to merge
-            if el2.offset > el1.offset + el1.duration.quarterLength + 0.1:
-                i += 1
-                continue
-
-            are_notes = isinstance(el1, music21.note.Note) and isinstance(el2, music21.note.Note)
-            are_chords = isinstance(el1, music21.chord.Chord) and isinstance(el2, music21.chord.Chord)
-
-            if (are_notes and el1.pitch == el2.pitch) or \
-               (are_chords and el1.normalOrder == el2.normalOrder):
-                # Extend the duration of the first element
+            el2 = elements[i + 1]
+            
+            # Check if we can merge these notes
+            can_merge = False
+            
+            if isinstance(el1, music21.note.Note) and isinstance(el2, music21.note.Note):
+                # Same pitch and very close in time
+                if (el1.pitch == el2.pitch and 
+                    abs(el2.offset - (el1.offset + el1.duration.quarterLength)) < 0.1):
+                    can_merge = True
+            
+            if can_merge:
+                # Extend the duration of the first note
                 el1.duration.quarterLength += el2.duration.quarterLength
-                # Mark the second element for removal from the original stream
                 notes_to_remove.append(el2)
-                # Remove the second element from our temporary list so we don't process it again
                 elements.pop(i + 1)
             else:
                 i += 1
         
-        # Remove the merged notes from the actual score part
+        # Remove merged notes
         for note in notes_to_remove:
             part.remove(note, recurse=True)
+    
+    return score
 
-    # Remove very short notes (less than a 32nd note)
-    for el in quantized_score.flatten().notes:
-        if el.duration.quarterLength < 0.125:
-            el.activeSite.remove(el)
+def separate_hands(score):
+    """
+    Attempt to separate notes into left and right hand parts based on pitch.
+    """
+    # Find the median pitch to use as a split point
+    all_pitches = []
+    for part in score.parts:
+        for element in part.flatten().notes:
+            if isinstance(element, music21.note.Note):
+                all_pitches.append(element.pitch.midi)
+            elif isinstance(element, music21.chord.Chord):
+                for note in element.notes:
+                    all_pitches.append(note.pitch.midi)
+    
+    if not all_pitches:
+        return score
+    
+    # Use middle C (60) as default split, or median if it's reasonable
+    split_point = 60  # Middle C
+    if all_pitches:
+        median_pitch = np.median(all_pitches)
+        if 48 <= median_pitch <= 72:  # Reasonable range around middle C
+            split_point = median_pitch
+    
+    # Create new parts
+    right_hand = music21.stream.Part()
+    left_hand = music21.stream.Part()
+    
+    # Add instruments
+    right_hand.insert(0, music21.instrument.Piano())
+    left_hand.insert(0, music21.instrument.Piano())
+    
+    # Distribute notes
+    for part in score.parts:
+        for element in part.flatten().notes:
+            element_copy = element.__deepcopy__()
+            
+            if isinstance(element, music21.note.Note):
+                if element.pitch.midi >= split_point:
+                    right_hand.insert(element.offset, element_copy)
+                else:
+                    left_hand.insert(element.offset, element_copy)
+            elif isinstance(element, music21.chord.Chord):
+                # Split chords based on average pitch
+                avg_pitch = sum(n.pitch.midi for n in element.notes) / len(element.notes)
+                if avg_pitch >= split_point:
+                    right_hand.insert(element.offset, element_copy)
+                else:
+                    left_hand.insert(element.offset, element_copy)
+    
+    # Create new score with separated hands
+    new_score = music21.stream.Score()
+    if len(right_hand.notes) > 0:
+        new_score.append(right_hand)
+    if len(left_hand.notes) > 0:
+        new_score.append(left_hand)
+    
+    # Copy metadata
+    for element in score.flatten():
+        if isinstance(element, (music21.tempo.MetronomeMark, music21.key.KeySignature, 
+                              music21.meter.TimeSignature)):
+            new_score.insert(0, element)
+    
+    return new_score if len(new_score.parts) > 0 else score
 
+def simplify_midi(midi_path, output_path="midi_simplified"):
+    """
+    Comprehensively simplify a MIDI file for easier sheet music reading.
+    """
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+
+    print("Loading MIDI file...")
+    score = music21.converter.parse(midi_path)
+    
+    print("Detecting key signature...")
+    key = detect_key_signature(score)
+    score.insert(0, key)
+    
+    print("Filtering low-confidence notes...")
+    score = filter_notes_by_confidence(score, velocity_threshold=30)
+    
+    print("Removing ornaments and grace notes...")
+    score = remove_ornaments_and_grace_notes(score)
+    
+    print("Quantizing to common rhythms...")
+    score = quantize_to_common_rhythms(score)
+    
+    print("Merging tied notes...")
+    score = merge_tied_notes(score)
+    
+    print("Simplifying chords...")
+    score = simplify_chords(score, max_chord_notes=3)
+    
+    print("Separating hands...")
+    score = separate_hands(score)
+    
+    # Final quantization
+    print("Final quantization...")
+    score = score.quantize(quarterLengthDivisors=[4, 3])  # Allow triplets
+    
+    # Add time signature if missing
+    if not score.getElementsByClass(music21.meter.TimeSignature):
+        score.insert(0, music21.meter.TimeSignature('4/4'))
+    
     simplified_midi_path = os.path.join(output_path, os.path.splitext(os.path.basename(midi_path))[0] + "_simplified.mid")
-    quantized_score.write('midi', fp=simplified_midi_path)
+    score.write('midi', fp=simplified_midi_path)
     return simplified_midi_path
+
+def create_sheet_music(midi_path, output_path="partitures"):
+    """
+    Creates sheet music from a MIDI file with better formatting.
+    """
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+        
+    score = music21.converter.parse(midi_path)
+    
+    # Add title if missing
+    if not score.metadata:
+        score.metadata = music21.metadata.Metadata()
+        score.metadata.title = 'Transcribed Piano Music'
+    
+    # Ensure proper clefs are set
+    for i, part in enumerate(score.parts):
+        if i == 0:  # First part (right hand)
+            part.insert(0, music21.clef.TrebleClef())
+        elif i == 1:  # Second part (left hand)
+            part.insert(0, music21.clef.BassClef())
+    
+    output_sheet_path = os.path.join(output_path, os.path.splitext(os.path.basename(midi_path))[0] + ".xml")
+    score.write('musicxml', fp=output_sheet_path)
+    return output_sheet_path
 
 def main():
     """
-    Main function to process the YouTube video.
+    Main function to process the YouTube video with improved transcription.
     """
-    parser = argparse.ArgumentParser(description='Transcribe piano audio from YouTube to MIDI and sheet music.')
+    parser = argparse.ArgumentParser(description='Transcribe piano audio from YouTube to simplified MIDI and sheet music.')
     parser.add_argument('url', type=str, help='The YouTube URL to process.')
     parser.add_argument('--start', type=int, help='Start time in seconds.')
     parser.add_argument('--end', type=int, help='End time in seconds.')
+    parser.add_argument('--velocity-threshold', type=int, default=30, 
+                       help='Minimum velocity for notes to be included (default: 30).')
+    parser.add_argument('--max-chord-notes', type=int, default=3,
+                       help='Maximum number of notes in a chord (default: 3).')
+    
     args = parser.parse_args()
 
     print("Downloading audio...")
@@ -254,15 +357,22 @@ def main():
     print("Transcribing audio to MIDI...")
     midi_file = transcribe_audio(audio_file)
 
-    print("Simplifying MIDI...")
+    print("Applying advanced MIDI simplification...")
     simplified_midi_file = simplify_midi(midi_file)
     
     print("Creating sheet music from simplified MIDI...")
     sheet_music_file = create_sheet_music(simplified_midi_file)
     
-    print(f"\nSuccessfully created MIDI file: {midi_file}")
-    print(f"Successfully created simplified MIDI file: {simplified_midi_file}")
-    print(f"Successfully created sheet music: {sheet_music_file}")
+    print(f"\nSuccessfully created:")
+    print(f"  Original MIDI: {midi_file}")
+    print(f"  Simplified MIDI: {simplified_midi_file}")
+    print(f"  Sheet music: {sheet_music_file}")
+    
+    print(f"\nTips for better results:")
+    print(f"  - Use shorter audio clips (30-60 seconds)")
+    print(f"  - Ensure audio has minimal background noise")
+    print(f"  - Try adjusting --velocity-threshold (lower = more notes)")
+    print(f"  - Try adjusting --max-chord-notes for simpler chords")
 
 if __name__ == "__main__":
     main()
