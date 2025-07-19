@@ -1,20 +1,23 @@
 import os
 from yt_dlp import YoutubeDL
-from basic_pitch.inference import predict
-from basic_pitch import ICASSP_2022_MODEL_PATH
 import music21
 import argparse
 import numpy as np
 from collections import Counter
+from gradio_client import Client, handle_file
+import shutil
 
-def download_audio(url, output_path="audio", start_time=None, end_time=None):
+def download_audio(url, output_path="audio", start_time=None, end_time=None, name=None):
     """
     Downloads a specific segment of audio from a YouTube video.
     """
     if not os.path.exists(output_path):
         os.makedirs(output_path)
 
-    output_template = os.path.join(output_path, '%(id)s.%(ext)s')
+    if name:
+        output_template = os.path.join(output_path, f'{name}.%(ext)s')
+    else:
+        output_template = os.path.join(output_path, '%(id)s.%(ext)s')
 
     ydl_opts = {
         'format': 'bestaudio/best',
@@ -48,8 +51,11 @@ def download_audio(url, output_path="audio", start_time=None, end_time=None):
 
 def transcribe_audio(audio_path, output_path="midi"):
     """
-    Transcribes the audio to a MIDI file.
+    Transcribes the audio to a MIDI file using basic-pitch.
     """
+    from basic_pitch.inference import predict
+    from basic_pitch import ICASSP_2022_MODEL_PATH
+
     if not os.path.exists(output_path):
         os.makedirs(output_path)
         
@@ -58,6 +64,57 @@ def transcribe_audio(audio_path, output_path="midi"):
     output_midi_path = os.path.join(output_path, os.path.splitext(os.path.basename(audio_path))[0] + ".mid")
     midi_data.write(output_midi_path)
     return output_midi_path
+
+def transcribe_audio_mt3_api(audio_path, output_path="midi"):
+    """
+    Transcribes the audio to a MIDI file using the MT3 Hugging Face Space.
+    """
+    if not os.path.exists(output_path):
+        os.makedirs(output_path)
+
+    print("Connecting to MT3 API...")
+    client = Client("NeoPy/MT3", verbose=False)
+    print("Transcribing... (this may take a while)")
+    result = client.predict(
+        audio=handle_file(audio_path),
+        api_name="/inference"
+    )
+    
+    output_midi_path = os.path.join(output_path, os.path.splitext(os.path.basename(audio_path))[0] + ".mid")
+    # The result is a path to a temporary file, so we need to copy it
+    shutil.copyfile(result, output_midi_path)
+    
+    return output_midi_path
+
+def filter_piano_tracks(midi_path):
+    """
+    Filters a MIDI file to keep only the piano track(s).
+    If no specific piano track is found, it keeps the track with the most notes.
+    """
+    score = music21.converter.parse(midi_path)
+    piano_parts = []
+    
+    for part in score.parts:
+        if part.instrument is not None and 'Piano' in part.instrument.instrumentName:
+            piano_parts.append(part)
+
+    if not piano_parts:
+        # If no instrument is explicitly named "Piano", find the part with the most notes
+        max_notes = 0
+        best_part = None
+        for part in score.parts:
+            num_notes = len(part.flatten().notes)
+            if num_notes > max_notes:
+                max_notes = num_notes
+                best_part = part
+        if best_part is not None:
+            piano_parts.append(best_part)
+
+    if piano_parts:
+        new_score = music21.stream.Score()
+        for part in piano_parts:
+            new_score.insert(0, part)
+        new_score.write('midi', fp=midi_path)
 
 def detect_key_signature(score):
     """
@@ -196,7 +253,6 @@ def merge_tied_notes(score):
             else:
                 i += 1
         
-        # Remove merged notes
         for note in notes_to_remove:
             part.remove(note, recurse=True)
     
@@ -342,37 +398,58 @@ def main():
     """
     parser = argparse.ArgumentParser(description='Transcribe piano audio from YouTube to simplified MIDI and sheet music.')
     parser.add_argument('url', type=str, help='The YouTube URL to process.')
+    parser.add_argument('--name', type=str, help='A custom name for the output files.')
     parser.add_argument('--start', type=int, help='Start time in seconds.')
     parser.add_argument('--end', type=int, help='End time in seconds.')
-    parser.add_argument('--velocity-threshold', type=int, default=30, 
+    parser.add_argument('--model', type=str, default='mt3', choices=['basic-pitch', 'mt3'],
+                       help='The transcription model to use.')
+    parser.add_argument('--no-simplification', action='store_true', help='Skip the MIDI simplification process.')
+    parser.add_argument('--keep-all-instruments', action='store_true', help='Keep all instrument tracks from the transcription.')
+    parser.add_argument('--velocity-threshold', type=int, default=30,
                        help='Minimum velocity for notes to be included (default: 30).')
     parser.add_argument('--max-chord-notes', type=int, default=3,
                        help='Maximum number of notes in a chord (default: 3).')
-    
+
     args = parser.parse_args()
 
     print("Downloading audio...")
-    audio_file = download_audio(args.url, start_time=args.start, end_time=args.end)
-    
-    print("Transcribing audio to MIDI...")
-    midi_file = transcribe_audio(audio_file)
+    audio_file = download_audio(args.url, name=args.name, start_time=args.start, end_time=args.end)
 
-    print("Applying advanced MIDI simplification...")
-    simplified_midi_file = simplify_midi(midi_file)
-    
-    print("Creating sheet music from simplified MIDI...")
-    sheet_music_file = create_sheet_music(simplified_midi_file)
-    
-    print(f"\nSuccessfully created:")
+    print(f"Transcribing audio to MIDI using {args.model}...")
+    if args.model == 'mt3':
+        midi_file = transcribe_audio_mt3_api(audio_file)
+    else:
+        midi_file = transcribe_audio(audio_file)
+
+    if not args.keep_all_instruments:
+        print("Filtering for piano tracks...")
+        filter_piano_tracks(midi_file)
+
+    simplified_midi_file = None
+    if not args.no_simplification:
+        print("Applying advanced MIDI simplification...")
+        simplified_midi_file = simplify_midi(midi_file)
+        sheet_music_source = simplified_midi_file
+    else:
+        print("Skipping MIDI simplification.")
+        sheet_music_source = midi_file
+
+    print("Creating sheet music...")
+    sheet_music_file = create_sheet_music(sheet_music_source)
+
+    print("\nSuccessfully created:")
     print(f"  Original MIDI: {midi_file}")
-    print(f"  Simplified MIDI: {simplified_midi_file}")
+    if simplified_midi_file:
+        print(f"  Simplified MIDI: {simplified_midi_file}")
     print(f"  Sheet music: {sheet_music_file}")
-    
-    print(f"\nTips for better results:")
-    print(f"  - Use shorter audio clips (30-60 seconds)")
-    print(f"  - Ensure audio has minimal background noise")
-    print(f"  - Try adjusting --velocity-threshold (lower = more notes)")
-    print(f"  - Try adjusting --max-chord-notes for simpler chords")
+
+    print("\nTips for better results:")
+    print("  - Use shorter audio clips (30-60 seconds)")
+    print("  - Ensure audio has minimal background noise")
+    print("  - Try adjusting --velocity-threshold (lower = more notes)")
+    print("  - Try adjusting --max-chord-notes for simpler chords")
+    print("  - Use the --no-simplification flag if the transcription is already clean.")
+    print("  - Use the --keep-all-instruments flag to keep all transcribed instrument tracks.")
 
 if __name__ == "__main__":
     main()

@@ -1,3 +1,4 @@
 yt-dlp
 basic-pitch
 music21
+gradio_client
